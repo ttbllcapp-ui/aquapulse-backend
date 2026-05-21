@@ -121,6 +121,11 @@ async def get_user_from_token(authorization: Optional[str]) -> Optional[dict]:
 async def root():
     return {"message": "AquaPulse API", "status": "ok"}
 
+@api_router.get("/health")
+async def health():
+    return {"ok": True}
+
+
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
