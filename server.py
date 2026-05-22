@@ -43,9 +43,12 @@ class StatusCheckCreate(BaseModel):
 
 
 class AppleAuthRequest(BaseModel):
-    identity_token: str  # JWT issued by Apple
+    # Accept both camelCase (iOS SDK default) and snake_case
+    identity_token: Optional[str] = None
+    identityToken: Optional[str] = None
     nonce: Optional[str] = None
-    full_name: Optional[str] = None  # Apple only returns name on first sign-in
+    full_name: Optional[str] = None
+    fullName: Optional[str] = None
 
 
 class GoogleAuthRequest(BaseModel):
@@ -212,6 +215,14 @@ async def auth_google(req: GoogleAuthRequest):
 @api_router.post("/auth/apple", response_model=AuthMeResponse)
 async def auth_apple(req: AppleAuthRequest):
     """Verify Apple identity_token (JWT) against Apple's public keys, upsert user."""
+
+    # Accept both camelCase and snake_case from iOS frontend
+    token = req.identity_token or req.identityToken
+    if not token:
+        raise HTTPException(status_code=422, detail="identity_token is required")
+
+    name_from_req = req.full_name or req.fullName
+
     try:
         import jwt as pyjwt
         from jwt import PyJWKClient
@@ -221,9 +232,9 @@ async def auth_apple(req: AppleAuthRequest):
 
     try:
         jwks_client = PyJWKClient("https://appleid.apple.com/auth/keys", cache_keys=True)
-        signing_key = jwks_client.get_signing_key_from_jwt(req.identity_token)
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
         decoded = pyjwt.decode(
-            req.identity_token,
+            token,
             signing_key.key,
             algorithms=["RS256"],
             audience=["com.ttbinternationalllc.aquapulse", "host.exp.exponent"],
@@ -243,7 +254,7 @@ async def auth_apple(req: AppleAuthRequest):
     if not email:
         email = f"apple_{sub}@privaterelay.aquapulse.local"
 
-    name = req.full_name or email.split("@")[0]
+    name = name_from_req or email.split("@")[0]
 
     # Upsert user — index on email AND apple_sub to dedupe
     user = await db.users.find_one({"$or": [{"email": email}, {"apple_sub": sub}]}, {"_id": 0})
@@ -275,17 +286,13 @@ async def auth_apple(req: AppleAuthRequest):
         "provider": "apple",
     })
 
-    # Note: client must read session_token from a sibling endpoint or we include it in body
-    # For convenience we attach it via a custom header in a wrapper below. Here returning user.
-    resp = AuthMeResponse(
+    from fastapi.responses import JSONResponse
+    payload = AuthMeResponse(
         user_id=user["user_id"],
         email=email,
         name=name,
         picture=user.get("picture"),
-    )
-    # Inject session_token via FastAPI response — use a tuple response
-    from fastapi.responses import JSONResponse
-    payload = resp.dict()
+    ).dict()
     payload["session_token"] = session_token
     return JSONResponse(payload)
 
@@ -466,9 +473,7 @@ async def family_create(req: FamilyCreateRequest, authorization: Optional[str] =
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required to use Family Mode")
-    # Allow up to 2 owned families per user
     name = (req.name or "").strip()[:48] or "AquaPulse Family"
-    # Try to generate a unique code
     for _ in range(8):
         code = _gen_family_code()
         existing = await db.families.find_one({"code": code})
@@ -514,7 +519,6 @@ async def family_leave(authorization: Optional[str] = Header(default=None)):
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required")
-    # Remove from any families they belong to (most cases: 1)
     await db.families.update_many(
         {"members": user["user_id"]},
         {"$pull": {"members": user["user_id"]}},
@@ -561,7 +565,6 @@ async def family_me(authorization: Optional[str] = Header(default=None)):
     day = _today_str()
     members_progress = []
     for uid in fam.get("members", []):
-        # fetch user info
         u = await db.users.find_one({"user_id": uid}, {"_id": 0, "user_id": 1, "name": 1, "email": 1, "picture": 1})
         prog = await db.family_progress.find_one({"user_id": uid, "day": day}, {"_id": 0})
         members_progress.append({
@@ -575,7 +578,6 @@ async def family_me(authorization: Optional[str] = Header(default=None)):
             "is_me": uid == user["user_id"],
         })
     members_progress.sort(key=lambda m: m["percent"], reverse=True)
-    # Convert created_at if present
     if isinstance(fam.get("created_at"), datetime):
         fam["created_at"] = fam["created_at"].isoformat()
     return {"family": fam, "members": members_progress}
@@ -587,42 +589,27 @@ async def delete_my_account(authorization: Optional[str] = Header(default=None))
     """
     Permanently delete the authenticated user's account and ALL associated data.
     Required by Apple App Store guideline 5.1.1(v) and Google Play.
-    Wipes: user record, all sessions, chat history, family memberships, family progress.
-    If user owned a family and was the only member, the family is deleted.
-    Otherwise ownership is transferred to the next remaining member.
     """
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required")
     uid = user["user_id"]
 
-    # 1) Find any families the user owns
     owned_cursor = db.families.find({"owner_id": uid})
     async for fam in owned_cursor:
         remaining = [m for m in fam.get("members", []) if m != uid]
         if not remaining:
-            # Solo owner — delete the family entirely
             await db.families.delete_one({"family_id": fam["family_id"]})
         else:
-            # Transfer ownership to next member, remove self
             await db.families.update_one(
                 {"family_id": fam["family_id"]},
                 {"$set": {"owner_id": remaining[0]}, "$pull": {"members": uid}},
             )
 
-    # 2) Remove user from any other families
     await db.families.update_many({"members": uid}, {"$pull": {"members": uid}})
-
-    # 3) Wipe all family progress entries (all days)
     await db.family_progress.delete_many({"user_id": uid})
-
-    # 4) Wipe chat history (both auth and any guest sessions linked to email)
     await db.chat_messages.delete_many({"session_key": f"user:{uid}"})
-
-    # 5) Delete all sessions
     await db.user_sessions.delete_many({"user_id": uid})
-
-    # 6) Finally delete the user record
     await db.users.delete_one({"user_id": uid})
 
     return {"ok": True, "deleted_user_id": uid, "message": "Your account and all data have been permanently deleted."}
