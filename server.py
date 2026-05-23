@@ -21,7 +21,7 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url, tls=True, tlsAllowInvalidCertificates=True)
 db = client[os.environ['DB_NAME']]
 
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 
 # Create the main app without a prefix
 app = FastAPI(title="AquaPulse API")
@@ -258,7 +258,7 @@ async def auth_logout(authorization: Optional[str] = Header(default=None)):
     return {"ok": True}
 
 
-# ----- AI CHAT -----
+# ----- AI CHAT (Groq) -----
 SYSTEM_PROMPT_TEMPLATE = (
     "You are AquaCoach — a caring, premium best-friend hydration & breath coach inside AquaPulse. "
     "Talk warmly like a close friend, never like a clinical bot. "
@@ -290,14 +290,8 @@ async def chat(req: ChatRequest, authorization: Optional[str] = Header(default=N
     else:
         session_key = f"anon:{uuid.uuid4().hex[:8]}"
 
-    if not EMERGENT_LLM_KEY:
+    if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="LLM key not configured")
-
-    try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-    except Exception as e:
-        logger.error(f"LLM import error: {e}")
-        raise HTTPException(status_code=500, detail="LLM integration unavailable")
 
     lang_name = LANGUAGE_NAMES.get((req.language or 'en').lower(), 'English')
     ctx = req.context or {}
@@ -320,17 +314,34 @@ async def chat(req: ChatRequest, authorization: Optional[str] = Header(default=N
         context_str = "no specific personal data"
 
     system_msg = SYSTEM_PROMPT_TEMPLATE.format(language=lang_name, context=context_str)
-    await db.chat_messages.insert_one({"id": str(uuid.uuid4()), "session_key": session_key, "role": "user", "text": req.message, "timestamp": datetime.now(timezone.utc)})
+
+    await db.chat_messages.insert_one({
+        "id": str(uuid.uuid4()), "session_key": session_key,
+        "role": "user", "text": req.message, "timestamp": datetime.now(timezone.utc)
+    })
 
     try:
-        chat_engine = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_key, system_message=system_msg).with_model("openai", "gpt-4o")
-        reply_text = await chat_engine.send_message(UserMessage(text=req.message))
+        from groq import Groq
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        completion = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": req.message}
+            ],
+            max_tokens=300,
+            temperature=0.7,
+        )
+        reply_text = completion.choices[0].message.content
     except Exception as e:
-        logger.error(f"LLM error: {e}")
+        logger.error(f"Groq error: {e}")
         raise HTTPException(status_code=500, detail=f"AI error: {str(e)[:100]}")
 
     assistant_id = str(uuid.uuid4())
-    await db.chat_messages.insert_one({"id": assistant_id, "session_key": session_key, "role": "assistant", "text": reply_text, "timestamp": datetime.now(timezone.utc)})
+    await db.chat_messages.insert_one({
+        "id": assistant_id, "session_key": session_key,
+        "role": "assistant", "text": reply_text, "timestamp": datetime.now(timezone.utc)
+    })
     return ChatResponse(reply=reply_text, message_id=assistant_id)
 
 
