@@ -19,6 +19,7 @@ load_dotenv(ROOT_DIR / '.env')
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url, tls=True, tlsAllowInvalidCertificates=True)
+db = client[os.environ['DB_NAME']]
 
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 
@@ -42,7 +43,6 @@ class StatusCheckCreate(BaseModel):
 
 
 class AppleAuthRequest(BaseModel):
-    # Accept both camelCase (iOS SDK default) and snake_case
     identity_token: Optional[str] = None
     identityToken: Optional[str] = None
     nonce: Optional[str] = None
@@ -51,7 +51,7 @@ class AppleAuthRequest(BaseModel):
 
 
 class GoogleAuthRequest(BaseModel):
-    session_id: str  # token returned from Emergent OAuth
+    session_id: str
 
 
 class AuthMeResponse(BaseModel):
@@ -64,13 +64,12 @@ class AuthMeResponse(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     language: Optional[str] = 'en'
-    # Optional user-context for smarter AquaCoach answers (free, never required)
-    context: Optional[dict] = None  # {weight_kg, height_cm, age, gender, daily_goal_ml, hydration_today_ml, streak_days, country, percent}
+    context: Optional[dict] = None
 
 
 class ChatMessage(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    role: str  # 'user' | 'assistant'
+    role: str
     text: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -80,7 +79,6 @@ class ChatResponse(BaseModel):
     message_id: str
 
 
-# ===== Family Mode =====
 class FamilyCreateRequest(BaseModel):
     name: str
 
@@ -92,7 +90,7 @@ class FamilyJoinRequest(BaseModel):
 class FamilyDailyProgressRequest(BaseModel):
     daily_goal_ml: int
     hydration_today_ml: int
-    percent: int  # 0..100+
+    percent: int
     streak_days: Optional[int] = 0
 
 
@@ -104,7 +102,6 @@ def _aware(dt: datetime) -> datetime:
 
 
 async def get_user_from_token(authorization: Optional[str]) -> Optional[dict]:
-    """Resolve user from Bearer token. Returns None if invalid/missing."""
     if not authorization or not authorization.startswith('Bearer '):
         return None
     token = authorization[7:]
@@ -127,14 +124,11 @@ async def root():
 async def health():
     return {"ok": True}
 
-
-
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
     status_obj = StatusCheck(**input.dict())
     await db.status_checks.insert_one(status_obj.dict())
     return status_obj
-
 
 @api_router.get("/status", response_model=List[StatusCheck])
 async def get_status_checks(skip: int = 0, limit: int = 50):
@@ -142,7 +136,6 @@ async def get_status_checks(skip: int = 0, limit: int = 50):
     skip = max(0, skip)
     cursor = db.status_checks.find({}, {"_id": 0}).skip(skip).limit(limit)
     return [StatusCheck(**s) for s in await cursor.to_list(length=limit)]
-
 
 @api_router.get("/download/xcode")
 async def download_xcode_project():
@@ -155,7 +148,6 @@ async def download_xcode_project():
 # ----- AUTH -----
 @api_router.post("/auth/google", response_model=AuthMeResponse)
 async def auth_google(req: GoogleAuthRequest):
-    """Verify session_id with Emergent and create session for user."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as h:
             resp = await h.get(
@@ -176,46 +168,23 @@ async def auth_google(req: GoogleAuthRequest):
     if not email or not session_token:
         raise HTTPException(status_code=400, detail="Malformed auth response")
 
-    # Upsert user by email
     user = await db.users.find_one({"email": email}, {"_id": 0})
     if not user:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
-        user = {
-            "user_id": user_id,
-            "email": email,
-            "name": name,
-            "picture": picture,
-            "created_at": datetime.now(timezone.utc),
-        }
+        user = {"user_id": user_id, "email": email, "name": name, "picture": picture, "created_at": datetime.now(timezone.utc)}
         await db.users.insert_one(user)
     else:
-        # Refresh picture/name in case changed
-        await db.users.update_one(
-            {"email": email},
-            {"$set": {"name": name, "picture": picture}}
-        )
+        await db.users.update_one({"email": email}, {"$set": {"name": name, "picture": picture}})
 
-    # Store session
     await db.user_sessions.insert_one({
-        "session_token": session_token,
-        "user_id": user["user_id"],
-        "created_at": datetime.now(timezone.utc),
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+        "session_token": session_token, "user_id": user["user_id"],
+        "created_at": datetime.now(timezone.utc), "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
     })
-
-    return AuthMeResponse(
-        user_id=user["user_id"],
-        email=email,
-        name=name,
-        picture=picture,
-    )
+    return AuthMeResponse(user_id=user["user_id"], email=email, name=name, picture=picture)
 
 
 @api_router.post("/auth/apple", response_model=AuthMeResponse)
 async def auth_apple(req: AppleAuthRequest):
-    """Verify Apple identity_token (JWT) against Apple's public keys, upsert user."""
-
-    # Accept both camelCase and snake_case from iOS frontend
     token = req.identity_token or req.identityToken
     if not token:
         raise HTTPException(status_code=422, detail="identity_token is required")
@@ -233,12 +202,10 @@ async def auth_apple(req: AppleAuthRequest):
         jwks_client = PyJWKClient("https://appleid.apple.com/auth/keys", cache_keys=True)
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         decoded = pyjwt.decode(
-            token,
-            signing_key.key,
-            algorithms=["RS256"],
+            token, signing_key.key, algorithms=["RS256"],
             audience=["com.ttbinternationalllc.aquapulse", "host.exp.exponent"],
             issuer="https://appleid.apple.com",
-            options={"verify_aud": False},  # Allow both bundle ids without strict match
+            options={"verify_aud": False},
         )
     except Exception as e:
         logger.error(f"Apple JWT verify error: {e}")
@@ -248,50 +215,29 @@ async def auth_apple(req: AppleAuthRequest):
     email = decoded.get("email")
     if not sub:
         raise HTTPException(status_code=400, detail="Missing sub in Apple token")
-
-    # Apple "private email relay" gives a fake email; we still treat it as unique
     if not email:
         email = f"apple_{sub}@privaterelay.aquapulse.local"
 
     name = name_from_req or email.split("@")[0]
 
-    # Upsert user — index on email AND apple_sub to dedupe
     user = await db.users.find_one({"$or": [{"email": email}, {"apple_sub": sub}]}, {"_id": 0})
     if not user:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
-        user = {
-            "user_id": user_id,
-            "email": email,
-            "name": name,
-            "picture": None,
-            "apple_sub": sub,
-            "provider": "apple",
-            "created_at": datetime.now(timezone.utc),
-        }
+        user = {"user_id": user_id, "email": email, "name": name, "picture": None,
+                "apple_sub": sub, "provider": "apple", "created_at": datetime.now(timezone.utc)}
         await db.users.insert_one(user)
     else:
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$set": {"apple_sub": sub, "name": name or user.get("name")}}
-        )
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"apple_sub": sub, "name": name or user.get("name")}})
 
-    # Issue our own opaque session token
     session_token = f"apl_{uuid.uuid4().hex}{uuid.uuid4().hex[:8]}"
     await db.user_sessions.insert_one({
-        "session_token": session_token,
-        "user_id": user["user_id"],
-        "created_at": datetime.now(timezone.utc),
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=30),
+        "session_token": session_token, "user_id": user["user_id"],
+        "created_at": datetime.now(timezone.utc), "expires_at": datetime.now(timezone.utc) + timedelta(days=30),
         "provider": "apple",
     })
 
     from fastapi.responses import JSONResponse
-    payload = AuthMeResponse(
-        user_id=user["user_id"],
-        email=email,
-        name=name,
-        picture=user.get("picture"),
-    ).dict()
+    payload = AuthMeResponse(user_id=user["user_id"], email=email, name=name, picture=user.get("picture")).dict()
     payload["session_token"] = session_token
     return JSONResponse(payload)
 
@@ -301,12 +247,7 @@ async def auth_me(authorization: Optional[str] = Header(default=None)):
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return AuthMeResponse(
-        user_id=user["user_id"],
-        email=user["email"],
-        name=user.get("name", user["email"]),
-        picture=user.get("picture"),
-    )
+    return AuthMeResponse(user_id=user["user_id"], email=user["email"], name=user.get("name", user["email"]), picture=user.get("picture"))
 
 
 @api_router.post("/auth/logout")
@@ -326,12 +267,8 @@ SYSTEM_PROMPT_TEMPLATE = (
     "coherent 5.5/min, alt-nostril, ujjayi, Wim Hof, pre-sleep slowdown). "
     "CRITICAL LANGUAGE RULE: Detect the language of the user's MESSAGE and ALWAYS reply in that SAME language. "
     "If you cannot detect, default to {language}. "
-    "PERSONALIZATION: Use the user's CONTEXT below (weight, height, age, gender, daily goal, today's hydration %, streak) "
-    "when relevant. Reference concrete numbers (e.g. 'you've already had 1200 ml of your 2500 ml today'). "
-    "If context shows the user is far below goal, be gently motivating. If above 100%, celebrate. "
-    "Length: 80-160 words. Structure: warm opener (Hey!/Süper soru!) + 2-3 numbered tips with mechanism + tiny nudge. "
-    "Use 1-2 friendly emojis (💧🌊🫧🧘‍♀️☕💪). Never diagnose; recommend doctor for medical concerns. "
-    "Avoid 'as an AI' style phrases. Stay free, premium and trustworthy. "
+    "PERSONALIZATION: Use the user's CONTEXT below when relevant. "
+    "Length: 80-160 words. Use 1-2 friendly emojis (💧🌊🫧🧘‍♀️☕💪). Never diagnose. "
     "USER CONTEXT: {context}"
 )
 
@@ -345,7 +282,6 @@ LANGUAGE_NAMES = {
 
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, authorization: Optional[str] = Header(default=None), x_guest_id: Optional[str] = Header(default=None)):
-    """AI chat endpoint. Works for authenticated users and guests (with X-Guest-Id header)."""
     user = await get_user_from_token(authorization)
     if user:
         session_key = f"user:{user['user_id']}"
@@ -364,8 +300,6 @@ async def chat(req: ChatRequest, authorization: Optional[str] = Header(default=N
         raise HTTPException(status_code=500, detail="LLM integration unavailable")
 
     lang_name = LANGUAGE_NAMES.get((req.language or 'en').lower(), 'English')
-
-    # Build user-context for personalization
     ctx = req.context or {}
     if ctx:
         try:
@@ -384,38 +318,19 @@ async def chat(req: ChatRequest, authorization: Optional[str] = Header(default=N
             context_str = "no specific personal data"
     else:
         context_str = "no specific personal data"
-    system_msg = SYSTEM_PROMPT_TEMPLATE.format(language=lang_name, context=context_str)
 
-    # Store user message
-    user_msg_doc = {
-        "id": str(uuid.uuid4()),
-        "session_key": session_key,
-        "role": "user",
-        "text": req.message,
-        "timestamp": datetime.now(timezone.utc),
-    }
-    await db.chat_messages.insert_one(user_msg_doc)
+    system_msg = SYSTEM_PROMPT_TEMPLATE.format(language=lang_name, context=context_str)
+    await db.chat_messages.insert_one({"id": str(uuid.uuid4()), "session_key": session_key, "role": "user", "text": req.message, "timestamp": datetime.now(timezone.utc)})
 
     try:
-        chat_engine = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=session_key,
-            system_message=system_msg,
-        ).with_model("openai", "gpt-4o")
+        chat_engine = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_key, system_message=system_msg).with_model("openai", "gpt-4o")
         reply_text = await chat_engine.send_message(UserMessage(text=req.message))
     except Exception as e:
         logger.error(f"LLM error: {e}")
         raise HTTPException(status_code=500, detail=f"AI error: {str(e)[:100]}")
 
     assistant_id = str(uuid.uuid4())
-    await db.chat_messages.insert_one({
-        "id": assistant_id,
-        "session_key": session_key,
-        "role": "assistant",
-        "text": reply_text,
-        "timestamp": datetime.now(timezone.utc),
-    })
-
+    await db.chat_messages.insert_one({"id": assistant_id, "session_key": session_key, "role": "assistant", "text": reply_text, "timestamp": datetime.now(timezone.utc)})
     return ChatResponse(reply=reply_text, message_id=assistant_id)
 
 
@@ -431,7 +346,6 @@ async def chat_history(authorization: Optional[str] = Header(default=None), x_gu
     limit = max(1, min(limit, 200))
     cursor = db.chat_messages.find({"session_key": session_key}, {"_id": 0}).sort("timestamp", 1).limit(limit)
     msgs = await cursor.to_list(length=limit)
-    # Convert datetime -> iso
     for m in msgs:
         if isinstance(m.get('timestamp'), datetime):
             m['timestamp'] = m['timestamp'].isoformat()
@@ -457,7 +371,6 @@ import string as _string
 
 
 def _gen_family_code(length: int = 6) -> str:
-    """Generate an easy-to-share code, avoiding ambiguous chars like O/0/I/1."""
     pool = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(_random.choice(pool) for _ in range(length))
 
@@ -468,7 +381,6 @@ def _today_str() -> str:
 
 @api_router.post("/family/create")
 async def family_create(req: FamilyCreateRequest, authorization: Optional[str] = Header(default=None)):
-    """Create a family group. Authenticated only."""
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required to use Family Mode")
@@ -480,16 +392,8 @@ async def family_create(req: FamilyCreateRequest, authorization: Optional[str] =
             break
     else:
         raise HTTPException(status_code=500, detail="Could not generate code, please retry")
-
     family_id = str(uuid.uuid4())
-    doc = {
-        "family_id": family_id,
-        "code": code,
-        "name": name,
-        "owner_id": user["user_id"],
-        "members": [user["user_id"]],
-        "created_at": datetime.now(timezone.utc),
-    }
+    doc = {"family_id": family_id, "code": code, "name": name, "owner_id": user["user_id"], "members": [user["user_id"]], "created_at": datetime.now(timezone.utc)}
     await db.families.insert_one(doc)
     return {"family_id": family_id, "code": code, "name": name, "members": [user["user_id"]]}
 
@@ -506,10 +410,7 @@ async def family_join(req: FamilyJoinRequest, authorization: Optional[str] = Hea
     if not fam:
         raise HTTPException(status_code=404, detail="Family not found")
     if user["user_id"] not in fam.get("members", []):
-        await db.families.update_one(
-            {"family_id": fam["family_id"]},
-            {"$addToSet": {"members": user["user_id"]}},
-        )
+        await db.families.update_one({"family_id": fam["family_id"]}, {"$addToSet": {"members": user["user_id"]}})
     return {"family_id": fam["family_id"], "code": fam["code"], "name": fam["name"]}
 
 
@@ -518,35 +419,22 @@ async def family_leave(authorization: Optional[str] = Header(default=None)):
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required")
-    await db.families.update_many(
-        {"members": user["user_id"]},
-        {"$pull": {"members": user["user_id"]}},
-    )
+    await db.families.update_many({"members": user["user_id"]}, {"$pull": {"members": user["user_id"]}})
     return {"ok": True}
 
 
 @api_router.post("/family/progress")
 async def family_progress_update(req: FamilyDailyProgressRequest, authorization: Optional[str] = Header(default=None)):
-    """Submit today's hydration progress. Stored per (user, day). Authenticated only."""
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required")
     day = _today_str()
     await db.family_progress.update_one(
         {"user_id": user["user_id"], "day": day},
-        {
-            "$set": {
-                "user_id": user["user_id"],
-                "day": day,
-                "daily_goal_ml": int(req.daily_goal_ml),
-                "hydration_today_ml": int(req.hydration_today_ml),
-                "percent": int(max(0, min(999, req.percent))),
-                "streak_days": int(req.streak_days or 0),
-                "updated_at": datetime.now(timezone.utc),
-                "name": user.get("name", ""),
-                "picture": user.get("picture", ""),
-            }
-        },
+        {"$set": {"user_id": user["user_id"], "day": day, "daily_goal_ml": int(req.daily_goal_ml),
+                  "hydration_today_ml": int(req.hydration_today_ml), "percent": int(max(0, min(999, req.percent))),
+                  "streak_days": int(req.streak_days or 0), "updated_at": datetime.now(timezone.utc),
+                  "name": user.get("name", ""), "picture": user.get("picture", "")}},
         upsert=True,
     )
     return {"ok": True}
@@ -554,7 +442,6 @@ async def family_progress_update(req: FamilyDailyProgressRequest, authorization:
 
 @api_router.get("/family/me")
 async def family_me(authorization: Optional[str] = Header(default=None)):
-    """Return the family the user belongs to (first one) and today's leaderboard."""
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required")
@@ -567,14 +454,10 @@ async def family_me(authorization: Optional[str] = Header(default=None)):
         u = await db.users.find_one({"user_id": uid}, {"_id": 0, "user_id": 1, "name": 1, "email": 1, "picture": 1})
         prog = await db.family_progress.find_one({"user_id": uid, "day": day}, {"_id": 0})
         members_progress.append({
-            "user_id": uid,
-            "name": (u or {}).get("name") or (u or {}).get("email") or "Member",
-            "picture": (u or {}).get("picture"),
-            "percent": (prog or {}).get("percent", 0),
-            "hydration_today_ml": (prog or {}).get("hydration_today_ml", 0),
-            "daily_goal_ml": (prog or {}).get("daily_goal_ml", 0),
-            "streak_days": (prog or {}).get("streak_days", 0),
-            "is_me": uid == user["user_id"],
+            "user_id": uid, "name": (u or {}).get("name") or (u or {}).get("email") or "Member",
+            "picture": (u or {}).get("picture"), "percent": (prog or {}).get("percent", 0),
+            "hydration_today_ml": (prog or {}).get("hydration_today_ml", 0), "daily_goal_ml": (prog or {}).get("daily_goal_ml", 0),
+            "streak_days": (prog or {}).get("streak_days", 0), "is_me": uid == user["user_id"],
         })
     members_progress.sort(key=lambda m: m["percent"], reverse=True)
     if isinstance(fam.get("created_at"), datetime):
@@ -582,39 +465,27 @@ async def family_me(authorization: Optional[str] = Header(default=None)):
     return {"family": fam, "members": members_progress}
 
 
-# ============== ACCOUNT DELETION (Apple Store Requirement) ==============
 @api_router.delete("/auth/me")
 async def delete_my_account(authorization: Optional[str] = Header(default=None)):
-    """
-    Permanently delete the authenticated user's account and ALL associated data.
-    Required by Apple App Store guideline 5.1.1(v) and Google Play.
-    """
     user = await get_user_from_token(authorization)
     if not user:
         raise HTTPException(status_code=401, detail="Sign in required")
     uid = user["user_id"]
-
     owned_cursor = db.families.find({"owner_id": uid})
     async for fam in owned_cursor:
         remaining = [m for m in fam.get("members", []) if m != uid]
         if not remaining:
             await db.families.delete_one({"family_id": fam["family_id"]})
         else:
-            await db.families.update_one(
-                {"family_id": fam["family_id"]},
-                {"$set": {"owner_id": remaining[0]}, "$pull": {"members": uid}},
-            )
-
+            await db.families.update_one({"family_id": fam["family_id"]}, {"$set": {"owner_id": remaining[0]}, "$pull": {"members": uid}})
     await db.families.update_many({"members": uid}, {"$pull": {"members": uid}})
     await db.family_progress.delete_many({"user_id": uid})
     await db.chat_messages.delete_many({"session_key": f"user:{uid}"})
     await db.user_sessions.delete_many({"user_id": uid})
     await db.users.delete_one({"user_id": uid})
-
     return {"ok": True, "deleted_user_id": uid, "message": "Your account and all data have been permanently deleted."}
 
 
-# ============== STARTUP / INDEXES ==============
 @app.on_event("startup")
 async def on_startup():
     try:
@@ -639,7 +510,6 @@ async def shutdown_db_client():
     client.close()
 
 
-# Include the router in the main app
 app.include_router(api_router)
 
 app.add_middleware(
