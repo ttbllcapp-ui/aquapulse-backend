@@ -18,8 +18,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+client = AsyncIOMotorClient(mongo_url, tls=True, tlsAllowInvalidCertificates=True)
 
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 
