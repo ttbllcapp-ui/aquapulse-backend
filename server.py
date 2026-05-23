@@ -324,7 +324,7 @@ async def chat(req: ChatRequest, authorization: Optional[str] = Header(default=N
         from groq import Groq
         groq_client = Groq(api_key=GROQ_API_KEY)
         completion = groq_client.chat.completions.create(
-            model="llama3-8b-8192",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": req.message}
